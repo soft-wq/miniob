@@ -268,6 +268,7 @@ RC RecordPageHandler::cleanup()
 
 RC RowRecordPageHandler::insert_record(const char *data, RID *rid)
 {
+  // your code here
   ASSERT(rw_mode_ != ReadWriteMode::READ_ONLY, 
          "cannot insert record into page while the page is readonly");
 
@@ -417,7 +418,43 @@ bool RecordPageHandler::is_full() const { return page_header_->record_num >= pag
 RC PaxRecordPageHandler::insert_record(const char *data, RID *rid)
 {
   // your code here
-  exit(-1);
+  ASSERT(rw_mode_ != ReadWriteMode::READ_ONLY, 
+         "cannot insert record into page while the page is readonly");
+
+  if (page_header_->record_num == page_header_->record_capacity) {
+    LOG_WARN("Page is full, page_num %d:%d.", disk_buffer_pool_->file_desc(), frame_->page_num());
+    return RC::RECORD_NOMEM;
+  }
+
+  // 找到空闲位置
+  Bitmap bitmap(bitmap_, page_header_->record_capacity);
+  int    index = bitmap.next_unsetted_bit(0);
+  bitmap.set_bit(index);
+  page_header_->record_num++;
+
+  RC rc = log_handler_.insert_record(frame_, RID(get_page_num(), index), data);
+  if (OB_FAIL(rc)) {
+    LOG_ERROR("Failed to insert record. page_num %d:%d. rc=%s", disk_buffer_pool_->file_desc(), frame_->page_num(), strrc(rc));
+    // return rc; // ignore errors
+  }
+
+  // assert index < page_header_->record_capacity 
+  for(int col_id=0;col_id<page_header_->column_num;col_id++){
+    int col_len = get_field_len(col_id);
+    char* field_data = get_field_data(index,col_id);
+    memcpy(field_data,data,col_len);
+    data += col_len;
+  }
+
+  frame_->mark_dirty();
+
+  if (rid) {
+    rid->page_num = get_page_num();
+    rid->slot_num = index;
+  }
+
+  // LOG_TRACE("Insert record. rid page_num=%d, slot num=%d", get_page_num(), index);
+  return RC::SUCCESS;
 }
 
 RC PaxRecordPageHandler::delete_record(const RID *rid)
@@ -447,14 +484,52 @@ RC PaxRecordPageHandler::delete_record(const RID *rid)
 RC PaxRecordPageHandler::get_record(const RID &rid, Record &record)
 {
   // your code here
-  exit(-1);
+  if (rid.slot_num >= page_header_->record_capacity) {
+    LOG_ERROR("Invalid slot_num %d, exceed page's record capacity, frame=%s, page_header=%s",
+              rid.slot_num, frame_->to_string().c_str(), page_header_->to_string().c_str());
+    return RC::RECORD_INVALID_RID;
+  }
+
+  Bitmap bitmap(bitmap_, page_header_->record_capacity);
+  if (!bitmap.get_bit(rid.slot_num)) {
+    LOG_ERROR("Invalid slot_num:%d, slot is empty, page_num %d.", rid.slot_num, frame_->page_num());
+    return RC::RECORD_NOT_EXIST;
+  }
+  char* data_head = (char*)malloc(page_header_->record_real_size+1);
+  char* data_ptr = data_head;
+
+  for(int col_id = 0;col_id<page_header_->column_num;col_id++){
+    int col_len = get_field_len(col_id);
+    char* field_data = get_field_data(rid.slot_num,col_id);
+    memcpy(data_ptr,field_data,col_len);
+    data_ptr += col_len;
+  }
+  record.set_rid(rid);
+  record.copy_data(data_head,page_header_->record_real_size);
+  free(data_head);
+  return RC::SUCCESS;
 }
 
 // TODO: specify the column_ids that chunk needed. currenly we get all columns
 RC PaxRecordPageHandler::get_chunk(Chunk &chunk)
 {
   // your code here
-  exit(-1);
+  int column_size = chunk.column_num();
+  Bitmap bitmap(bitmap_, page_header_->record_capacity);
+  for(int col_id = 0;col_id<column_size;col_id++){
+    int real_col_id = chunk.column_ids(col_id);
+    if(real_col_id >= page_header_->column_num){
+      LOG_ERROR("Invalid column num:%d, column is emptty, page_num %d", real_col_id,frame_->page_num());
+      return RC::RECORD_NOT_EXIST;
+    }
+    int index = bitmap.next_setted_bit(0);
+    while(index != -1){
+      char * column_data = get_field_data(index, real_col_id);
+      chunk.column(col_id).append_one(column_data);
+      index = bitmap.next_setted_bit(index + 1);
+    }
+  }
+  return RC::SUCCESS;
 }
 
 char *PaxRecordPageHandler::get_field_data(SlotNum slot_num, int col_id)
